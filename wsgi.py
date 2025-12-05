@@ -8,6 +8,7 @@ if path not in sys.path:
 
 # Импортируем Flask приложение
 from app import create_app
+from config import TOKEN
 
 # Инициализируем приложение
 application = create_app()  # Важно: переменная должна называться 'application'
@@ -18,11 +19,11 @@ with application.app_context():
     import telebot
 
     # Получаем токен из переменных окружения PythonAnywhere
-    token = os.environ.get('TELEGRAM_TOKEN')
+    token = TOKEN
 
     if token:
         # Инициализируем и настраиваем бота
-        bot = init_bot(token)
+        bot = init_bot(TOKEN)
         setup_handlers(bot)
         print("✅ Бот инициализирован")
 
