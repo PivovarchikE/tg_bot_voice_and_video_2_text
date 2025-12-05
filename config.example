@@ -1,0 +1,3 @@
+# Здесь нужно вставить токен, который дал BotFather, а также WEBHOOK
+TOKEN = ''
+WEBHOOK_URL = ''
