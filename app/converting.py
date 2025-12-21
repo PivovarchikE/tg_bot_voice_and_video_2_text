@@ -1,40 +1,126 @@
 import os
 
-import speech_recognition
+import speech_recognition as sr
+import tempfile
 from pydub import AudioSegment
+import io
+import moviepy as mp
 
-def oga2wav(filename):
-    # конвертация формата файлов
-    new_filename = filename.replace('.oga', '.wav')
-    audio = AudioSegment.from_file(filename)
-    audio.export(new_filename, format="wav")
+
+def split_audio_segments(filename, chunk_duration_ms=15000):
+    """Разделить аудио на сегменты по 15 секунд"""
+    try:
+        # Загружаем аудио
+        audio = AudioSegment.from_file(filename)
+        duration_ms = len(audio)
+
+        chunks = []
+
+        # Разделяем на части по chunk_duration_ms
+        for start_ms in range(0, duration_ms, chunk_duration_ms):
+            end_ms = min(start_ms + chunk_duration_ms, duration_ms)
+            chunk = audio[start_ms:end_ms]
+
+            # Создаем временный файл для chunk
+            chunk_buffer = io.BytesIO()
+            chunk.export(chunk_buffer, format="wav")
+            chunk_buffer.seek(0)
+
+            chunks.append(chunk_buffer)
+
+            # Если осталось меньше 3 секунд, объединяем с предыдущим
+            if duration_ms - end_ms < 3000 and chunks:
+                break
+
+        print(f"Разделили на {len(chunks)} частей по ~{chunk_duration_ms / 1000} сек")
+        return chunks
+
+    except Exception as e:
+        print(f"Ошибка разделения аудио: {e}")
+        # Если не удалось разделить, возвращаем оригинал
+        with open(filename, 'rb') as f:
+            buffer = io.BytesIO(f.read())
+        return [buffer]
+
+
+def recognize_speech_chunked(filename):
+    """Распознавание речи с разделением на части"""
+    try:
+        # Разделяем аудио на части
+        audio_chunks = split_audio_segments(filename)
+
+        if len(audio_chunks) == 0:
+            return "Не удалось обработать аудио"
+
+        recognizer = sr.Recognizer()
+        all_texts = []
+
+        # Обрабатываем каждую часть
+        for i, chunk_buffer in enumerate(audio_chunks, 1):
+            print(f"Обрабатываю часть {i}/{len(audio_chunks)}...")
+
+            try:
+                # Используем BytesIO для AudioFile
+                chunk_buffer.seek(0)
+                with sr.AudioFile(chunk_buffer) as source:
+                    # Регулируем уровень шума
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = recognizer.record(source)
+
+                # Распознаем часть
+                text = recognizer.recognize_google(
+                    audio,
+                    language='ru',
+                    show_all=False
+                )
+
+                all_texts.append(text)
+                print(f"  Часть {i}: {text[:50]}...")
+
+            except sr.UnknownValueError:
+                print(f"  Часть {i}: не распознано")
+                all_texts.append("[неразборчиво]")
+            except sr.RequestError as e:
+                print(f"  Часть {i}: ошибка API - {e}")
+                all_texts.append(f"[ошибка API]")
+            except Exception as e:
+                print(f"  Часть {i}: ошибка - {str(e)[:50]}")
+                all_texts.append(f"[ошибка обработки]")
+
+        # Объединяем все части
+        full_text = " ".join(all_texts)
+
+        # Очистка файла
+        if os.path.exists(filename):
+            os.remove(filename)
+
+        return full_text
+
+    except Exception as e:
+        print(f"Общая ошибка recognize_speech: {e}")
+        return f"Ошибка обработки: {str(e)[:100]}"
+
+
+def convert_to_wav(filename):
+    if 'mp4' in filename:
+        new_filename = filename.replace('.oga', '.wav')
+        video = mp.VideoFileClip(filename)
+        video.audio.write_audiofile(new_filename)
+    else:
+        new_filename = filename.replace('.oga', '.wav')
+        audio = AudioSegment.from_file(filename)
+        audio.export(new_filename, format="wav")
     return new_filename
-
-def recognize_speech(oga_filename):
-    # Перевод голоса в текст + удаление использованных файлов
-    wav_filename = oga2wav(oga_filename)
-    recognizer = speech_recognition.Recognizer()
-
-    with speech_recognition.WavFile(wav_filename) as source:
-        wav_audio = recognizer.record(source)
-
-    text = recognizer.recognize_google(wav_audio, language='ru')
-
-    if os.path.exists(oga_filename):
-        os.remove(oga_filename)
-
-    if os.path.exists(wav_filename):
-        os.remove(wav_filename)
-
-    return text
 
 
 def download_file(bot, file_id):
     # Скачивание файла, который прислал пользователь
+    print('+++++++Начал скачивать')
     file_info = bot.get_file(file_id)
     downloaded_file = bot.download_file(file_info.file_path)
     filename = file_id + file_info.file_path
     filename = filename.replace('/', '_')
     with open(filename, 'wb') as f:
         f.write(downloaded_file)
+    print('+++++++Закончил скачивать')
     return filename
