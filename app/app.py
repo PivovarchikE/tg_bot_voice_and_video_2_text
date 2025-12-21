@@ -6,7 +6,7 @@ import json
 from telebot import types
 
 from config import TOKEN, WEBHOOK_URL
-from .converting import recognize_speech, download_file
+from .converting import recognize_speech_chunked, download_file
 
 # Настройка логирования
 logging.basicConfig(
@@ -31,9 +31,8 @@ def handle_start(message):
 
         hi_text = (
             '🤖 Я бот для перевода голоса в текст\n\n'
-            '📱 Просто отправь мне голосовое сообщение\n'
+            '📱 Просто перешли мне голосовое сообщение или кружок\n'
             '🔊 Я преобразую его в текст\n'
-            '🚀 Попробуй отправить голосовое!'
         )
         bot.send_message(message.chat.id, hi_text)
 
@@ -50,13 +49,35 @@ def handle_voice(message):
         # bot.send_message(message.chat.id, "🎤 Голосовое сообщение получено!")
         # app.logger.info("✅ Заглушка отправлена")
 
+        bot.send_message(message.chat.id,f"🎤 Голосовое сообщение получено, слушаю ...")
+
         filename = download_file(bot, message.voice.file_id)
-        text = recognize_speech(filename)
+        text = recognize_speech_chunked(filename)
         bot.send_message(message.chat.id, f"📝 Текст:\n\n{text}")
 
     except Exception as e:
         app.logger.error(f"❌ Ошибка: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка обработки")
+
+
+# Обработчик кружков
+def handle_video_note(message):
+    app.logger.info(f"🎥 Кружок от {message.chat.id}")
+    try:
+        # # Заглушка для теста
+        # bot.send_message(message.chat.id, "🎥 Кружок получен!")
+        # app.logger.info("✅ Заглушка отправлена")
+
+        bot.send_message(message.chat.id,f"🎥 Видеосообщение получено, слушаю ...")
+
+        filename = download_file(bot, message.video_note.file_id)
+        text = recognize_speech_chunked(filename)
+        bot.send_message(message.chat.id, f"📝 Текст:\n\n{text}")
+
+    except Exception as e:
+        app.logger.error(f"❌ Ошибка: {e}")
+        bot.send_message(message.chat.id, "❌ Ошибка обработки")
+
 
 # ВЕБХУК с ручной обработкой
 @app.route('/webhook', methods=['POST'])
@@ -100,6 +121,11 @@ def webhook():
                 elif 'voice' in message_data:
                     app.logger.info("🎤 Голосовое сообщение")
                     handle_voice(message_obj)
+                    app.logger.info("✅ Голосовое обработано")
+
+                elif 'video_note' in message_data:
+                    app.logger.info("🎤 Голосовое сообщение")
+                    handle_video_note(message_obj)
                     app.logger.info("✅ Голосовое обработано")
 
                 else:
@@ -168,4 +194,4 @@ except Exception as e:
     app.logger.error(f"❌ Ошибка: {e}")
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
