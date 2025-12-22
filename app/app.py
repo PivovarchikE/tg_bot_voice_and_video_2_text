@@ -1,17 +1,18 @@
 import telebot
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import logging
 import sys
 import json
+import threading
+import time
 from telebot import types
 
 from config import TOKEN, WEBHOOK_URL
-from .converting import recognize_speech_chunked, download_file
+from .converting import recognize_speech_chunked, download_file, send_text_in_parts
 
 # Настройка логирования
 logging.basicConfig(
-    # level=logging.DEBUG, # подробное логирование
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     stream=sys.stdout
 )
@@ -21,6 +22,30 @@ bot = telebot.TeleBot(TOKEN)
 
 app.logger.info(f"🚀 Бот запущен")
 app.logger.info(f"Вебхук: {WEBHOOK_URL}")
+
+# Хранилище для фоновых задач (чтобы избежать повторной обработки)
+processed_messages = set()
+pending_tasks = {}
+
+def is_already_processed(message_id, chat_id):
+    """Проверяет, обрабатывается ли уже это сообщение"""
+    key = f"{chat_id}:{message_id}"
+    return key in processed_messages or key in pending_tasks
+
+def mark_as_processing(message_id, chat_id):
+    """Помечает сообщение как обрабатываемое"""
+    key = f"{chat_id}:{message_id}"
+    pending_tasks[key] = time.time()
+
+def mark_as_processed(message_id, chat_id):
+    """Помечает сообщение как обработанное"""
+    key = f"{chat_id}:{message_id}"
+    pending_tasks.pop(key, None)
+    # Храним ID последних 100 обработанных сообщений
+    processed_messages.add(key)
+    if len(processed_messages) > 100:
+        # Удаляем самые старые
+        processed_messages.pop()
 
 # Обработчик команд
 def handle_start(message):
@@ -41,107 +66,188 @@ def handle_start(message):
     except Exception as e:
         app.logger.error(f"❌ Ошибка: {e}")
 
-# Обработчик голосовых
-def handle_voice(message):
-    app.logger.info(f"🎤 Голосовое от {message.chat.id}")
+# Фоновая обработка голосовых
+def process_voice_background(message_data, message_obj):
+    """Фоновая обработка голосового сообщения"""
     try:
-        # # Заглушка для теста
-        # bot.send_message(message.chat.id, "🎤 Голосовое сообщение получено!")
-        # app.logger.info("✅ Заглушка отправлена")
+        chat_id = message_data['chat']['id']
+        message_id = message_data['message_id']
 
-        bot.send_message(message.chat.id,f"🎤 Голосовое сообщение получено, слушаю ...")
+        # Проверяем, не обрабатывается ли уже
+        if is_already_processed(message_id, chat_id):
+            app.logger.info(f"⏭️ Сообщение {chat_id}:{message_id} уже обрабатывается, пропускаем")
+            return
 
-        filename = download_file(bot, message.voice.file_id)
+        # Помечаем как обрабатываемое
+        mark_as_processing(message_id, chat_id)
+
+        # Уведомляем пользователя
+        bot.send_message(chat_id, "🎤 Голосовое сообщение получено, слушаю...")
+
+        # Обработка
+        filename = download_file(bot, message_obj.voice.file_id)
         text = recognize_speech_chunked(filename)
-        bot.send_message(message.chat.id, f"📝 Текст:\n\n{text}")
+
+        # Отправка результата
+        send_text_in_parts(
+            bot=bot,
+            chat_id=chat_id,
+            text=text,
+        )
+
+        # Помечаем как обработанное
+        mark_as_processed(message_id, chat_id)
+        app.logger.info(f"✅ Голосовое {chat_id}:{message_id} обработано в фоне")
 
     except Exception as e:
-        app.logger.error(f"❌ Ошибка: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка обработки")
+        app.logger.error(f"❌ Фоновая ошибка голосового: {e}")
+        try:
+            bot.send_message(chat_id, "❌ Ошибка обработки голосового сообщения")
+        except:
+            pass
+        finally:
+            # Снимаем блокировку при ошибке
+            if 'chat_id' in locals() and 'message_id' in locals():
+                pending_tasks.pop(f"{chat_id}:{message_id}", None)
 
-
-# Обработчик кружков
-def handle_video_note(message):
-    app.logger.info(f"🎥 Кружок от {message.chat.id}")
+# Фоновая обработка кружков
+def process_video_note_background(message_data, message_obj):
+    """Фоновая обработка видеосообщения"""
     try:
-        # # Заглушка для теста
-        # bot.send_message(message.chat.id, "🎥 Кружок получен!")
-        # app.logger.info("✅ Заглушка отправлена")
+        chat_id = message_data['chat']['id']
+        message_id = message_data['message_id']
 
-        bot.send_message(message.chat.id,f"🎥 Видеосообщение получено, слушаю ...")
+        # Проверяем, не обрабатывается ли уже
+        if is_already_processed(message_id, chat_id):
+            app.logger.info(f"⏭️ Сообщение {chat_id}:{message_id} уже обрабатывается, пропускаем")
+            return
 
-        filename = download_file(bot, message.video_note.file_id)
+        # Помечаем как обрабатываемое
+        mark_as_processing(message_id, chat_id)
+
+        # Уведомляем пользователя
+        bot.send_message(chat_id, "🎥 Видеосообщение получено, слушаю...")
+
+        # Обработка
+        filename = download_file(bot, message_obj.video_note.file_id)
         text = recognize_speech_chunked(filename)
-        bot.send_message(message.chat.id, f"📝 Текст:\n\n{text}")
+
+        # Отправка результата
+        send_text_in_parts(
+            bot=bot,
+            chat_id=chat_id,
+            text=text,
+        )
+
+        # Помечаем как обработанное
+        mark_as_processed(message_id, chat_id)
+        app.logger.info(f"✅ Видеосообщение {chat_id}:{message_id} обработано в фоне")
 
     except Exception as e:
-        app.logger.error(f"❌ Ошибка: {e}")
-        bot.send_message(message.chat.id, "❌ Ошибка обработки")
+        app.logger.error(f"❌ Фоновая ошибка видеосообщения: {e}")
+        try:
+            bot.send_message(chat_id, "❌ Ошибка обработки видеосообщения")
+        except:
+            pass
+        finally:
+            # Снимаем блокировку при ошибке
+            if 'chat_id' in locals() and 'message_id' in locals():
+                pending_tasks.pop(f"{chat_id}:{message_id}", None)
 
-
-# ВЕБХУК с ручной обработкой
+# ВЕБХУК с мгновенным ответом
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Вебхук, который отвечает мгновенно и обрабатывает в фоне"""
     app.logger.info("📨 ВЕБХУК ПОЛУЧЕН")
+
+    # 1. НЕМЕДЛЕННО возвращаем ответ Telegram
+    response = Response('OK', status=200)
 
     if request.headers.get('content-type') == 'application/json':
         try:
+            # Быстро читаем данные
             json_str = request.get_data().decode('utf-8')
-            app.logger.info(f"📦 Длина данных: {len(json_str)} chars")
-
-            # Парсим
             data = json.loads(json_str)
 
+            # Если есть сообщение - запускаем в фоне
             if 'message' in data:
                 message_data = data['message']
                 chat_id = message_data['chat']['id']
+                message_id = message_data.get('message_id')
 
-                app.logger.info(f"💬 Чат: {chat_id}")
+                app.logger.info(f"💬 Чат: {chat_id}, Сообщение ID: {message_id}")
 
-                # Создаем объект Message
+                # Проверяем дубликат
+                if message_id and is_already_processed(message_id, chat_id):
+                    app.logger.info(f"🔄 Дубликат вебхука, игнорируем")
+                    return response
+
+                # Создаем объект Message для фоновой обработки
                 message_obj = types.Message.de_json(message_data)
 
-                # Проверяем тип сообщения
+                # Определяем тип и запускаем в фоне
                 if 'text' in message_data:
                     text = message_data['text']
-                    app.logger.info(f"📝 Текст: {text}")
-
-                    if text == '/start' or text == '/start@voice_and_video_to_text_bot':
+                    if text == '/start' or text.startswith('/start'):
+                        # Команды обрабатываем сразу (они быстрые)
                         handle_start(message_obj)
-                        app.logger.info("✅ /start обработан")
-
                     elif text.startswith('/'):
-                        # Другие команды
                         bot.send_message(chat_id, f"Команда {text} не поддерживается")
 
-                    else:
-                        # Обычный текст
-                        bot.send_message(chat_id, f"Вы написали: {text}")
-
                 elif 'voice' in message_data:
-                    app.logger.info("🎤 Голосовое сообщение")
-                    handle_voice(message_obj)
-                    app.logger.info("✅ Голосовое обработано")
+                    app.logger.info("🎤 Голосовое (запуск в фоне)")
+                    # Запускаем в отдельном потоке
+                    thread = threading.Thread(
+                        target=process_voice_background,
+                        args=(message_data, message_obj),
+                        daemon=True
+                    )
+                    thread.start()
 
                 elif 'video_note' in message_data:
-                    app.logger.info("🎤 Голосовое сообщение")
-                    handle_video_note(message_obj)
-                    app.logger.info("✅ Голосовое обработано")
+                    app.logger.info("🎥 Видеосообщение (запуск в фоне)")
+                    # Запускаем в отдельном потоке
+                    thread = threading.Thread(
+                        target=process_video_note_background,
+                        args=(message_data, message_obj),
+                        daemon=True
+                    )
+                    thread.start()
 
                 else:
-                    app.logger.warning(f"⚠️ Неизвестный тип сообщения: {list(message_data.keys())}")
-                    bot.send_message(chat_id, "Извините, я пока не обрабатываю этот тип сообщений")
+                    app.logger.warning(f"⚠️ Неизвестный тип")
 
-            app.logger.info("✅ Вебхук обработан")
-            return jsonify({"status": "ok"}), 200
+            app.logger.info("✅ Вебхук принят, обработка в фоне")
 
         except Exception as e:
-            app.logger.error(f"❌ Ошибка вебхука: {e}", exc_info=True)
-            return jsonify({"error": str(e)}), 500
+            app.logger.error(f"❌ Ошибка парсинга вебхука: {e}")
+            # Все равно возвращаем OK, чтобы Telegram не слал повторно
+    else:
+        app.logger.warning("⚠️ Неверный content-type")
 
-    return jsonify({"error": "Invalid content type"}), 400
+    return response  # Важно: возвращаем подготовленный response
 
-# Главная страница
+# Очистка старых задач (раз в час)
+def cleanup_old_tasks():
+    """Очищает старые задачи, которые висят слишком долго"""
+    while True:
+        time.sleep(3600)  # Раз в час
+        now = time.time()
+        to_remove = []
+
+        for key, start_time in pending_tasks.items():
+            if now - start_time > 7200:  # 2 часа
+                to_remove.append(key)
+                app.logger.warning(f"🧹 Удаляю зависшую задачу: {key}")
+
+        for key in to_remove:
+            pending_tasks.pop(key, None)
+
+# Запуск очистки в фоне
+cleanup_thread = threading.Thread(target=cleanup_old_tasks, daemon=True)
+cleanup_thread.start()
+
+# Главная страница (без изменений)
 @app.route('/')
 def home():
     return '''
@@ -156,6 +262,7 @@ def home():
             <li>Отправьте голосовое сообщение для теста</li>
         </ul>
         <p><a href="/send-test">Отправить тест</a></p>
+        <p><strong>⚠️ Длинные голосовые обрабатываются в фоне до 30 минут</strong></p>
     </body>
     </html>
     '''
@@ -167,7 +274,7 @@ def send_test():
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = {
         "chat_id": 1014682122,
-        "text": "✅ Бот работает корректно!"
+        "text": "✅ Бот работает корректно! (Webhook мгновенный, обработка в фоне)"
     }
 
     response = requests.post(url, json=data)
@@ -178,6 +285,16 @@ def send_test():
         <p><a href="/">← На главную</a></p>
     </div>
     '''
+
+# Статус задач
+@app.route('/tasks')
+def show_tasks():
+    """Показывает текущие задачи"""
+    return jsonify({
+        "pending_tasks": pending_tasks,
+        "processed_count": len(processed_messages),
+        "timestamp": time.time()
+    })
 
 # Установка вебхука
 try:
@@ -191,7 +308,7 @@ try:
     app.logger.info(f"ℹ️ Вебхук: {check['result']['url']}")
 
 except Exception as e:
-    app.logger.error(f"❌ Ошибка: {e}")
+    app.logger.error(f"❌ Ошибка установки вебхука: {e}")
 
 if __name__ == "__main__":
     app.run(debug=False)
