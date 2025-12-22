@@ -75,7 +75,7 @@ def recognize_speech_chunked(filename):
                 )
 
                 all_texts.append(text)
-                print(f"  Часть {i}: {text[:50]}...")
+                print(f"  Часть {i}: done ...")
 
             except sr.UnknownValueError:
                 print(f"  Часть {i}: не распознано")
@@ -124,3 +124,37 @@ def download_file(bot, file_id):
         f.write(downloaded_file)
     print('+++++++Закончил скачивать')
     return filename
+
+
+def send_text_in_parts(bot, chat_id, text, reply_to_msg_id=None):
+    """
+    Простая отправка текста частями
+    """
+    MAX_LEN = 4090
+
+    if len(text) <= MAX_LEN:
+        bot.send_message(chat_id, text, reply_to_message_id=reply_to_msg_id)
+        return 1
+
+    parts = []
+    while text:
+        if len(text) <= MAX_LEN:
+            parts.append(text)
+            break
+
+        # Разбиваем по последнему пробелу
+        split_at = text.rfind(' ', 0, MAX_LEN)
+        if split_at <= 0:
+            split_at = MAX_LEN
+
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip()
+
+    # Отправляем
+    for i, part in enumerate(parts):
+        if i == 0 and reply_to_msg_id:
+            bot.send_message(chat_id, part, reply_to_message_id=reply_to_msg_id)
+        else:
+            bot.send_message(chat_id, part)
+
+    return len(parts)
