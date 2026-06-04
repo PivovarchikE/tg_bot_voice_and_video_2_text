@@ -1,43 +1,40 @@
 import os
-
-import speech_recognition as sr
-import tempfile
-from pydub import AudioSegment
 import io
+import speech_recognition as sr
 import moviepy as mp
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+from config import TOKEN_WIT
 
-
-def split_audio_segments(filename, chunk_duration_ms=15000):
-    """Разделить аудио на сегменты по 15 секунд"""
+def split_audio_segments(filename):
+    """Разделить аудио на сегменты по тишине и вернуть список буферов BytesIO"""
     try:
         # Загружаем аудио
         audio = AudioSegment.from_file(filename)
-        duration_ms = len(audio)
 
-        chunks = []
+        # Находим чанки по тишине
+        audio_chunks = split_on_silence(
+            audio,
+            min_silence_len=500,  # минимальная длина тишины в мс
+            silence_thresh=audio.dBFS - 14,  # порог тишины
+            keep_silence=500  # оставить немного тишины по краям для естественности
+        )
 
-        # Разделяем на части по chunk_duration_ms
-        for start_ms in range(0, duration_ms, chunk_duration_ms):
-            end_ms = min(start_ms + chunk_duration_ms, duration_ms)
-            chunk = audio[start_ms:end_ms]
+        processed_chunks = []
 
-            # Создаем временный файл для chunk
+        # Конвертируем каждый AudioSegment чанк в BytesIO буфер, как и ожидает распознаватель
+        for chunk in audio_chunks:
             chunk_buffer = io.BytesIO()
             chunk.export(chunk_buffer, format="wav")
             chunk_buffer.seek(0)
+            processed_chunks.append(chunk_buffer)
 
-            chunks.append(chunk_buffer)
-
-            # Если осталось меньше 3 секунд, объединяем с предыдущим
-            if duration_ms - end_ms < 3000 and chunks:
-                break
-
-        print(f"Разделили на {len(chunks)} частей по ~{chunk_duration_ms / 1000} сек")
-        return chunks
+        print(f"Разделили по тишине на {len(processed_chunks)} частей")
+        return processed_chunks
 
     except Exception as e:
         print(f"Ошибка разделения аудио: {e}")
-        # Если не удалось разделить, возвращаем оригинал
+        # Если не удалось разделить, возвращаем оригинал в виде буфера
         with open(filename, 'rb') as f:
             buffer = io.BytesIO(f.read())
         return [buffer]
@@ -50,7 +47,7 @@ def recognize_speech_chunked(filename):
         audio_chunks = split_audio_segments(filename)
 
         if len(audio_chunks) == 0:
-            return "Не удалось обработать аудио"
+            return "Не удалось обработать аудио (тишина или ошибка)"
 
         recognizer = sr.Recognizer()
         all_texts = []
@@ -60,37 +57,35 @@ def recognize_speech_chunked(filename):
             print(f"Обрабатываю часть {i}/{len(audio_chunks)}...")
 
             try:
-                # Используем BytesIO для AudioFile
+                # Теперь chunk_buffer — это гарантированно BytesIO
                 chunk_buffer.seek(0)
                 with sr.AudioFile(chunk_buffer) as source:
-                    # Регулируем уровень шума
-                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
                     audio = recognizer.record(source)
 
-                # Распознаем часть
-                text = recognizer.recognize_google(
+                # Распознаем часть через Wit.ai
+                text = recognizer.recognize_wit(
                     audio,
-                    language='ru',
-                    show_all=False
+                    key=TOKEN_WIT
                 )
 
-                all_texts.append(text)
-                print(f"  Часть {i}: done ...")
+                if text.strip():
+                    all_texts.append(text)
+                print(f"  Часть {i}: {text[:50]}...")
 
             except sr.UnknownValueError:
                 print(f"  Часть {i}: не распознано")
                 all_texts.append("[неразборчиво]")
             except sr.RequestError as e:
                 print(f"  Часть {i}: ошибка API - {e}")
-                all_texts.append(f"[ошибка API]")
+                all_texts.append("[ошибка API]")
             except Exception as e:
                 print(f"  Часть {i}: ошибка - {str(e)[:50]}")
-                all_texts.append(f"[ошибка обработки]")
+                all_texts.append("[ошибка обработки]")
 
         # Объединяем все части
         full_text = " ".join(all_texts)
 
-        # Очистка файла
+        # Очистка исходного файла
         if os.path.exists(filename):
             os.remove(filename)
 
@@ -102,19 +97,34 @@ def recognize_speech_chunked(filename):
 
 
 def convert_to_wav(filename):
-    if 'mp4' in filename:
-        new_filename = filename.replace('.oga', '.wav')
+    """Конвертация любого входящего аудио/видео файла в моно-WAV 16кГц"""
+    # Безопасная замена любого старого расширения на .wav
+    base, _ = os.path.splitext(filename)
+    new_filename = base + '.wav'
+
+    if 'mp4' in filename or filename.endswith('.mp4'):
         video = mp.VideoFileClip(filename)
-        video.audio.write_audiofile(new_filename)
+        # Сразу жмем аудио при извлечении из видео для экономии CPU на PythonAnywhere
+        video.audio.write_audiofile(
+            new_filename,
+            fps=16000,
+            nbytes=2,
+            buffersize=2000,
+            codec='pcm_s16le',
+            verbose=False,
+            logger=None
+        )
+        video.close()  # Закрываем клип, чтобы освободить ресурсы RAM
     else:
-        new_filename = filename.replace('.oga', '.wav')
         audio = AudioSegment.from_file(filename)
+        audio = audio.set_channels(1)  # Обязательно Mono
+        audio = audio.set_frame_rate(16000)  # Оптимально для речи
         audio.export(new_filename, format="wav")
+
     return new_filename
 
 
 def download_file(bot, file_id):
-    # Скачивание файла, который прислал пользователь
     print('+++++++Начал скачивать')
     file_info = bot.get_file(file_id)
     downloaded_file = bot.download_file(file_info.file_path)
@@ -127,9 +137,6 @@ def download_file(bot, file_id):
 
 
 def send_text_in_parts(bot, chat_id, text, reply_to_msg_id=None):
-    """
-    Простая отправка текста частями
-    """
     MAX_LEN = 4090
 
     if len(text) <= MAX_LEN:
@@ -142,7 +149,6 @@ def send_text_in_parts(bot, chat_id, text, reply_to_msg_id=None):
             parts.append(text)
             break
 
-        # Разбиваем по последнему пробелу
         split_at = text.rfind(' ', 0, MAX_LEN)
         if split_at <= 0:
             split_at = MAX_LEN
@@ -150,7 +156,6 @@ def send_text_in_parts(bot, chat_id, text, reply_to_msg_id=None):
         parts.append(text[:split_at])
         text = text[split_at:].lstrip()
 
-    # Отправляем
     for i, part in enumerate(parts):
         if i == 0 and reply_to_msg_id:
             bot.send_message(chat_id, part, reply_to_message_id=reply_to_msg_id)
