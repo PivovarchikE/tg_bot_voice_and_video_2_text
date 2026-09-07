@@ -6,10 +6,14 @@ import logging
 import threading
 from flask import Flask, request, jsonify, Response
 import telebot
-from telebot import types
+from telebot import types, apihelper
 
 from config import TOKEN, WEBHOOK_URL
 from .converting import recognize_speech_chunked, download_file, send_text_in_parts
+
+# Включаем автоматический повтор запросов при сбоях прокси/сети
+apihelper.RETRY_ON_ERROR = True
+apihelper.RETRY_TIMEOUT_SECONDS = 3
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,25 +28,21 @@ bot = telebot.TeleBot(TOKEN)
 app.logger.info("🚀 Бот запущен")
 app.logger.info(f"Вебхук адрес из конфига: {WEBHOOK_URL}")
 
-# Хранилище для фоновых задач
 processed_messages = set()
 pending_tasks = {}
 
 
 def is_already_processed(message_id, chat_id):
-    """Проверяет, обрабатывается ли уже это сообщение"""
     key = f"{chat_id}:{message_id}"
     return key in processed_messages or key in pending_tasks
 
 
 def mark_as_processing(message_id, chat_id):
-    """Помечает сообщение как обрабатываемое"""
     key = f"{chat_id}:{message_id}"
     pending_tasks[key] = time.time()
 
 
 def mark_as_processed(message_id, chat_id):
-    """Помечает сообщение как обработанное"""
     key = f"{chat_id}:{message_id}"
     pending_tasks.pop(key, None)
     processed_messages.add(key)
@@ -50,10 +50,7 @@ def mark_as_processed(message_id, chat_id):
         processed_messages.pop()
 
 
-# Обработчик команд
 def handle_start(message):
-    """Обработчик команды /start"""
-    app.logger.info(f"🔥 Обработка /start для {message.chat.id}")
     try:
         bot.send_message(message.chat.id, f'✅ Привет, {message.from_user.first_name}!')
         hi_text = (
@@ -66,9 +63,7 @@ def handle_start(message):
         app.logger.error(f"❌ Ошибка в /start: {e}")
 
 
-# Фоновая обработка голосовых
 def process_voice_background(message_data, message_obj):
-    """Фоновая обработка голосового сообщения"""
     chat_id = message_data['chat']['id']
     message_id = message_data['message_id']
     try:
@@ -76,7 +71,12 @@ def process_voice_background(message_data, message_obj):
             return
 
         mark_as_processing(message_id, chat_id)
-        bot.send_message(chat_id, "🎤 Голосовое сообщение получено, обрабатываю...")
+
+        # Некритичное статусное сообщение (ошибка тут не должна ломать обработку)
+        try:
+            bot.send_message(chat_id, "🎤 Голосовое сообщение получено, обрабатываю...")
+        except Exception as e:
+            app.logger.warning(f"⚠️ Не удалось отправить статусный текст: {e}")
 
         filename = download_file(bot, message_obj.voice.file_id)
         text = recognize_speech_chunked(filename)
@@ -95,9 +95,7 @@ def process_voice_background(message_data, message_obj):
         pending_tasks.pop(f"{chat_id}:{message_id}", None)
 
 
-# Фоновая обработка кружков
 def process_video_note_background(message_data, message_obj):
-    """Фоновая обработка видеосообщения"""
     chat_id = message_data['chat']['id']
     message_id = message_data['message_id']
     try:
@@ -105,7 +103,12 @@ def process_video_note_background(message_data, message_obj):
             return
 
         mark_as_processing(message_id, chat_id)
-        bot.send_message(chat_id, "🎥 Видеосообщение получено, обрабатываю...")
+
+        # Некритичное статусное сообщение (ошибка тут не должна ломать обработку)
+        try:
+            bot.send_message(chat_id, "🎥 Видеосообщение получено, обрабатываю...")
+        except Exception as e:
+            app.logger.warning(f"⚠️ Не удалось отправить статусный текст: {e}")
 
         filename = download_file(bot, message_obj.video_note.file_id)
         text = recognize_speech_chunked(filename)
@@ -124,10 +127,8 @@ def process_video_note_background(message_data, message_obj):
         pending_tasks.pop(f"{chat_id}:{message_id}", None)
 
 
-# ВЕБХУК
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Принимает запросы от Telegram и запускает обработку в потоке"""
     response = Response('OK', status=200)
 
     if request.headers.get('content-type') == 'application/json':
@@ -146,17 +147,13 @@ def webhook():
                 message_obj = types.Message.de_json(message_data)
 
                 if 'text' in message_data:
-                    app.logger.info("📝 Текстовое сообщение")
                     text = message_data['text']
                     if text.startswith('/start'):
                         handle_start(message_obj)
                     elif text.startswith('/'):
                         bot.send_message(chat_id, f"Команда {text} не поддерживается")
-                    else:
-                        bot.send_message(chat_id, f"Вы написали: {text}")
 
                 elif 'voice' in message_data:
-                    app.logger.info("🎤 Голосовое (запуск в фоне)")
                     threading.Thread(
                         target=process_voice_background,
                         args=(message_data, message_obj),
@@ -164,7 +161,6 @@ def webhook():
                     ).start()
 
                 elif 'video_note' in message_data:
-                    app.logger.info("🎥 Видеосообщение (запуск в фоне)")
                     threading.Thread(
                         target=process_video_note_background,
                         args=(message_data, message_obj),
@@ -177,7 +173,6 @@ def webhook():
     return response
 
 
-# Фоновая очистка подвисших задач
 def cleanup_old_tasks():
     while True:
         time.sleep(3600)
@@ -198,7 +193,6 @@ def home():
     <head><title>🤖 Voice Bot</title></head>
     <body>
         <h1>✅ Бот работает!</h1>
-        <p>Отправьте голосовое или видеосообщение в Telegram.</p>
     </body>
     </html>
     '''

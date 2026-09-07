@@ -1,211 +1,166 @@
 import os
-import sys
-import json
+import io
 import time
-import logging
-import threading
-from flask import Flask, request, jsonify, Response
-import telebot
-from telebot import types, apihelper
-
-from config import TOKEN, WEBHOOK_URL
-from .converting import recognize_speech_chunked, download_file, send_text_in_parts
-
-# Включаем автоматический повтор запросов при сбоях прокси/сети
-apihelper.RETRY_ON_ERROR = True
-apihelper.RETRY_TIMEOUT_SECONDS = 3
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
-
-app = Flask(__name__)
-bot = telebot.TeleBot(TOKEN)
-
-app.logger.info("🚀 Бот запущен")
-app.logger.info(f"Вебхук адрес из конфига: {WEBHOOK_URL}")
-
-processed_messages = set()
-pending_tasks = {}
+import speech_recognition as sr
+import moviepy as mp
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+from config import TOKEN_WIT
 
 
-def is_already_processed(message_id, chat_id):
-    key = f"{chat_id}:{message_id}"
-    return key in processed_messages or key in pending_tasks
-
-
-def mark_as_processing(message_id, chat_id):
-    key = f"{chat_id}:{message_id}"
-    pending_tasks[key] = time.time()
-
-
-def mark_as_processed(message_id, chat_id):
-    key = f"{chat_id}:{message_id}"
-    pending_tasks.pop(key, None)
-    processed_messages.add(key)
-    if len(processed_messages) > 100:
-        processed_messages.pop()
-
-
-def handle_start(message):
+def split_audio_segments(filename):
+    """Разделить аудио на сегменты по тишине и вернуть список буферов BytesIO"""
     try:
-        bot.send_message(message.chat.id, f'✅ Привет, {message.from_user.first_name}!')
-        hi_text = (
-            '🤖 Я бот для перевода голоса в текст\n\n'
-            '📱 Просто перешли мне голосовое сообщение или кружок\n'
-            '🔊 Я преобразую его в текст\n'
+        audio = AudioSegment.from_file(filename)
+
+        audio_chunks = split_on_silence(
+            audio,
+            min_silence_len=500,
+            silence_thresh=audio.dBFS - 14,
+            keep_silence=500
         )
-        bot.send_message(message.chat.id, hi_text)
+
+        processed_chunks = []
+
+        for chunk in audio_chunks:
+            chunk_buffer = io.BytesIO()
+            chunk.export(chunk_buffer, format="wav")
+            chunk_buffer.seek(0)
+            processed_chunks.append(chunk_buffer)
+
+        print(f"Разделили по тишине на {len(processed_chunks)} частей")
+        return processed_chunks
+
     except Exception as e:
-        app.logger.error(f"❌ Ошибка в /start: {e}")
+        print(f"Ошибка разделения аудио: {e}")
+        with open(filename, 'rb') as f:
+            buffer = io.BytesIO(f.read())
+        return [buffer]
 
 
-def process_voice_background(message_data, message_obj):
-    chat_id = message_data['chat']['id']
-    message_id = message_data['message_id']
+def recognize_chunk_with_retry(recognizer, audio, max_retries=3, delay=2.0):
+    """Отправка чанка в Wit.ai с повторными попытками при таймаутах"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return recognizer.recognize_wit(audio, key=TOKEN_WIT)
+        except sr.RequestError as e:
+            if attempt < max_retries:
+                print(f"    ⚠️ Таймаут/ошибка сети ({e}). Попытка {attempt}/{max_retries}, повтор через {delay} сек...")
+                time.sleep(delay)
+            else:
+                raise e
+
+
+def recognize_speech_chunked(filename):
+    """Распознавание речи с разделением на части и обработкой таймаутов"""
     try:
-        if is_already_processed(message_id, chat_id):
-            return
+        audio_chunks = split_audio_segments(filename)
 
-        mark_as_processing(message_id, chat_id)
+        if len(audio_chunks) == 0:
+            return "Не удалось обработать аудио (тишина или ошибка)"
 
-        # Некритичное статусное сообщение (ошибка тут не должна ломать обработку)
-        try:
-            bot.send_message(chat_id, "🎤 Голосовое сообщение получено, обрабатываю...")
-        except Exception as e:
-            app.logger.warning(f"⚠️ Не удалось отправить статусный текст: {e}")
+        recognizer = sr.Recognizer()
+        all_texts = []
 
-        filename = download_file(bot, message_obj.voice.file_id)
-        text = recognize_speech_chunked(filename)
+        for i, chunk_buffer in enumerate(audio_chunks, 1):
+            print(f"Обрабатываю часть {i}/{len(audio_chunks)}...")
 
-        send_text_in_parts(bot=bot, chat_id=chat_id, text=text)
-        mark_as_processed(message_id, chat_id)
-        app.logger.info(f"✅ Голосовое {chat_id}:{message_id} обработано")
+            try:
+                chunk_buffer.seek(0)
+                with sr.AudioFile(chunk_buffer) as source:
+                    audio = recognizer.record(source)
 
-    except Exception as e:
-        app.logger.error(f"❌ Фоновая ошибка голосового: {e}")
-        try:
-            bot.send_message(chat_id, "❌ Ошибка обработки голосового сообщения")
-        except Exception:
-            pass
-    finally:
-        pending_tasks.pop(f"{chat_id}:{message_id}", None)
+                # Вызываем с автоматическими повторами при таймауте
+                text = recognize_chunk_with_retry(recognizer, audio, max_retries=3)
 
+                if text and text.strip():
+                    all_texts.append(text)
+                    print(f"  Часть {i}: {text[:50]}...")
+                else:
+                    print(f"  Часть {i}: пустой ответ")
 
-def process_video_note_background(message_data, message_obj):
-    chat_id = message_data['chat']['id']
-    message_id = message_data['message_id']
-    try:
-        if is_already_processed(message_id, chat_id):
-            return
+            except sr.UnknownValueError:
+                print(f"  Часть {i}: не распознано")
+            except sr.RequestError as e:
+                print(f"  Часть {i}: окончательная ошибка API после 3 попыток - {e}")
+                all_texts.append("[часть текста утеряна из-за таймаута]")
+            except Exception as e:
+                print(f"  Часть {i}: ошибка - {str(e)[:50]}")
 
-        mark_as_processing(message_id, chat_id)
+        full_text = " ".join(all_texts).strip()
 
-        # Некритичное статусное сообщение (ошибка тут не должна ломать обработку)
-        try:
-            bot.send_message(chat_id, "🎥 Видеосообщение получено, обрабатываю...")
-        except Exception as e:
-            app.logger.warning(f"⚠️ Не удалось отправить статусный текст: {e}")
+        if os.path.exists(filename):
+            os.remove(filename)
 
-        filename = download_file(bot, message_obj.video_note.file_id)
-        text = recognize_speech_chunked(filename)
-
-        send_text_in_parts(bot=bot, chat_id=chat_id, text=text)
-        mark_as_processed(message_id, chat_id)
-        app.logger.info(f"✅ Видеосообщение {chat_id}:{message_id} обработано")
+        return full_text if full_text else "Не удалось распознать текст."
 
     except Exception as e:
-        app.logger.error(f"❌ Фоновая ошибка видеосообщения: {e}")
-        try:
-            bot.send_message(chat_id, "❌ Ошибка обработки видеосообщения")
-        except Exception:
-            pass
-    finally:
-        pending_tasks.pop(f"{chat_id}:{message_id}", None)
+        print(f"Общая ошибка recognize_speech: {e}")
+        return f"Ошибка обработки: {str(e)[:100]}"
 
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    response = Response('OK', status=200)
+def convert_to_wav(filename):
+    """Конвертация любого входящего аудио/видео файла в моно-WAV 16кГц"""
+    base, _ = os.path.splitext(filename)
+    new_filename = base + '.wav'
 
-    if request.headers.get('content-type') == 'application/json':
-        try:
-            json_str = request.get_data().decode('utf-8')
-            data = json.loads(json_str)
+    if 'mp4' in filename or filename.endswith('.mp4'):
+        video = mp.VideoFileClip(filename)
+        video.audio.write_audiofile(
+            new_filename,
+            fps=16000,
+            nbytes=2,
+            buffersize=2000,
+            codec='pcm_s16le',
+            verbose=False,
+            logger=None
+        )
+        video.close()
+    else:
+        audio = AudioSegment.from_file(filename)
+        audio = audio.set_channels(1)
+        audio = audio.set_frame_rate(16000)
+        audio.export(new_filename, format="wav")
 
-            if 'message' in data:
-                message_data = data['message']
-                chat_id = message_data['chat']['id']
-                message_id = message_data.get('message_id')
-
-                if message_id and is_already_processed(message_id, chat_id):
-                    return response
-
-                message_obj = types.Message.de_json(message_data)
-
-                if 'text' in message_data:
-                    text = message_data['text']
-                    if text.startswith('/start'):
-                        handle_start(message_obj)
-                    elif text.startswith('/'):
-                        bot.send_message(chat_id, f"Команда {text} не поддерживается")
-
-                elif 'voice' in message_data:
-                    threading.Thread(
-                        target=process_voice_background,
-                        args=(message_data, message_obj),
-                        daemon=True
-                    ).start()
-
-                elif 'video_note' in message_data:
-                    threading.Thread(
-                        target=process_video_note_background,
-                        args=(message_data, message_obj),
-                        daemon=True
-                    ).start()
-
-        except Exception as e:
-            app.logger.error(f"❌ Ошибка вебхука: {e}")
-
-    return response
+    return new_filename
 
 
-def cleanup_old_tasks():
-    while True:
-        time.sleep(3600)
-        now = time.time()
-        to_remove = [k for k, start in pending_tasks.items() if now - start > 7200]
-        for key in to_remove:
-            pending_tasks.pop(key, None)
+def download_file(bot, file_id):
+    print('+++++++Начал скачивать')
+    file_info = bot.get_file(file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    filename = file_id + file_info.file_path
+    filename = filename.replace('/', '_')
+    with open(filename, 'wb') as f:
+        f.write(downloaded_file)
+    print('+++++++Закончил скачивать')
+    return filename
 
 
-threading.Thread(target=cleanup_old_tasks, daemon=True).start()
+def send_text_in_parts(bot, chat_id, text, reply_to_msg_id=None):
+    MAX_LEN = 4090
 
+    if len(text) <= MAX_LEN:
+        bot.send_message(chat_id, text, reply_to_message_id=reply_to_msg_id)
+        return 1
 
-@app.route('/')
-def home():
-    return '''
-    <!DOCTYPE html>
-    <html>
-    <head><title>🤖 Voice Bot</title></head>
-    <body>
-        <h1>✅ Бот работает!</h1>
-    </body>
-    </html>
-    '''
+    parts = []
+    while text:
+        if len(text) <= MAX_LEN:
+            parts.append(text)
+            break
 
+        split_at = text.rfind(' ', 0, MAX_LEN)
+        if split_at <= 0:
+            split_at = MAX_LEN
 
-@app.route('/tasks')
-def show_tasks():
-    return jsonify({
-        "pending_tasks": pending_tasks,
-        "processed_count": len(processed_messages),
-        "timestamp": time.time()
-    })
+        parts.append(text[:split_at])
+        text = text[split_at:].lstrip()
 
+    for i, part in enumerate(parts):
+        if i == 0 and reply_to_msg_id:
+            bot.send_message(chat_id, part, reply_to_message_id=reply_to_msg_id)
+        else:
+            bot.send_message(chat_id, part)
 
-if __name__ == "__main__":
-    app.run(debug=False)
+    return len(parts)
