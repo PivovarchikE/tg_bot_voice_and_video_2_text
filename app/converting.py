@@ -1,28 +1,27 @@
 import os
 import io
+import time
 import speech_recognition as sr
 import moviepy as mp
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from config import TOKEN_WIT
 
+
 def split_audio_segments(filename):
     """Разделить аудио на сегменты по тишине и вернуть список буферов BytesIO"""
     try:
-        # Загружаем аудио
         audio = AudioSegment.from_file(filename)
 
-        # Находим чанки по тишине
         audio_chunks = split_on_silence(
             audio,
-            min_silence_len=500,  # минимальная длина тишины в мс
-            silence_thresh=audio.dBFS - 14,  # порог тишины
-            keep_silence=500  # оставить немного тишины по краям для естественности
+            min_silence_len=500,
+            silence_thresh=audio.dBFS - 14,
+            keep_silence=500
         )
 
         processed_chunks = []
 
-        # Конвертируем каждый AudioSegment чанк в BytesIO буфер, как и ожидает распознаватель
         for chunk in audio_chunks:
             chunk_buffer = io.BytesIO()
             chunk.export(chunk_buffer, format="wav")
@@ -34,16 +33,27 @@ def split_audio_segments(filename):
 
     except Exception as e:
         print(f"Ошибка разделения аудио: {e}")
-        # Если не удалось разделить, возвращаем оригинал в виде буфера
         with open(filename, 'rb') as f:
             buffer = io.BytesIO(f.read())
         return [buffer]
 
 
+def recognize_chunk_with_retry(recognizer, audio, max_retries=3, delay=2.0):
+    """Отправка чанка в Wit.ai с повторными попытками при таймаутах"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return recognizer.recognize_wit(audio, key=TOKEN_WIT)
+        except sr.RequestError as e:
+            if attempt < max_retries:
+                print(f"    ⚠️ Таймаут/ошибка сети ({e}). Попытка {attempt}/{max_retries}, повтор через {delay} сек...")
+                time.sleep(delay)
+            else:
+                raise e
+
+
 def recognize_speech_chunked(filename):
-    """Распознавание речи с разделением на части"""
+    """Распознавание речи с разделением на части и обработкой таймаутов"""
     try:
-        # Разделяем аудио на части
         audio_chunks = split_audio_segments(filename)
 
         if len(audio_chunks) == 0:
@@ -52,44 +62,37 @@ def recognize_speech_chunked(filename):
         recognizer = sr.Recognizer()
         all_texts = []
 
-        # Обрабатываем каждую часть
         for i, chunk_buffer in enumerate(audio_chunks, 1):
             print(f"Обрабатываю часть {i}/{len(audio_chunks)}...")
 
             try:
-                # Теперь chunk_buffer — это гарантированно BytesIO
                 chunk_buffer.seek(0)
                 with sr.AudioFile(chunk_buffer) as source:
                     audio = recognizer.record(source)
 
-                # Распознаем часть через Wit.ai
-                text = recognizer.recognize_wit(
-                    audio,
-                    key=TOKEN_WIT
-                )
+                # Вызываем с автоматическими повторами при таймауте
+                text = recognize_chunk_with_retry(recognizer, audio, max_retries=3)
 
-                if text.strip():
+                if text and text.strip():
                     all_texts.append(text)
-                print(f"  Часть {i}: {text[:50]}...")
+                    print(f"  Часть {i}: {text[:50]}...")
+                else:
+                    print(f"  Часть {i}: пустой ответ")
 
             except sr.UnknownValueError:
                 print(f"  Часть {i}: не распознано")
-                all_texts.append("[неразборчиво]")
             except sr.RequestError as e:
-                print(f"  Часть {i}: ошибка API - {e}")
-                all_texts.append("[ошибка API]")
+                print(f"  Часть {i}: окончательная ошибка API после 3 попыток - {e}")
+                all_texts.append("[часть текста утеряна из-за таймаута]")
             except Exception as e:
                 print(f"  Часть {i}: ошибка - {str(e)[:50]}")
-                all_texts.append("[ошибка обработки]")
 
-        # Объединяем все части
-        full_text = " ".join(all_texts)
+        full_text = " ".join(all_texts).strip()
 
-        # Очистка исходного файла
         if os.path.exists(filename):
             os.remove(filename)
 
-        return full_text
+        return full_text if full_text else "Не удалось распознать текст."
 
     except Exception as e:
         print(f"Общая ошибка recognize_speech: {e}")
@@ -98,13 +101,11 @@ def recognize_speech_chunked(filename):
 
 def convert_to_wav(filename):
     """Конвертация любого входящего аудио/видео файла в моно-WAV 16кГц"""
-    # Безопасная замена любого старого расширения на .wav
     base, _ = os.path.splitext(filename)
     new_filename = base + '.wav'
 
     if 'mp4' in filename or filename.endswith('.mp4'):
         video = mp.VideoFileClip(filename)
-        # Сразу жмем аудио при извлечении из видео для экономии CPU на PythonAnywhere
         video.audio.write_audiofile(
             new_filename,
             fps=16000,
@@ -114,11 +115,11 @@ def convert_to_wav(filename):
             verbose=False,
             logger=None
         )
-        video.close()  # Закрываем клип, чтобы освободить ресурсы RAM
+        video.close()
     else:
         audio = AudioSegment.from_file(filename)
-        audio = audio.set_channels(1)  # Обязательно Mono
-        audio = audio.set_frame_rate(16000)  # Оптимально для речи
+        audio = audio.set_channels(1)
+        audio = audio.set_frame_rate(16000)
         audio.export(new_filename, format="wav")
 
     return new_filename
