@@ -127,7 +127,6 @@ def convert_to_wav(filename):
             nbytes=2,
             buffersize=2000,
             codec='pcm_s16le',
-            verbose=False,
             logger=None
         )
         video.close()
