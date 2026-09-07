@@ -9,26 +9,37 @@ from config import TOKEN_WIT
 
 
 def split_audio_segments(filename):
-    """Разделить аудио на сегменты по тишине и вернуть список буферов BytesIO"""
+    """Разделить аудио на сегменты по тишине с ограничением максимальной длины"""
     try:
         audio = AudioSegment.from_file(filename)
 
+        # Делаем порог чуть строже для компенсации фонового шума улицы
         audio_chunks = split_on_silence(
             audio,
             min_silence_len=500,
-            silence_thresh=audio.dBFS - 14,
-            keep_silence=500
+            silence_thresh=audio.dBFS - 16,
+            keep_silence=300
         )
 
-        processed_chunks = []
+        max_chunk_length_ms = 12000  # Максимум 12 секунд на один кусок
+        final_chunks = []
 
         for chunk in audio_chunks:
+            # Принудительно режем слишком длинные куски, чтобы избежать Request Timeout в Wit.ai
+            if len(chunk) > max_chunk_length_ms:
+                for i in range(0, len(chunk), max_chunk_length_ms):
+                    final_chunks.append(chunk[i:i + max_chunk_length_ms])
+            else:
+                final_chunks.append(chunk)
+
+        processed_chunks = []
+        for chunk in final_chunks:
             chunk_buffer = io.BytesIO()
             chunk.export(chunk_buffer, format="wav")
             chunk_buffer.seek(0)
             processed_chunks.append(chunk_buffer)
 
-        print(f"Разделили по тишине на {len(processed_chunks)} частей")
+        print(f"Разделили на {len(processed_chunks)} безопасных частей")
         return processed_chunks
 
     except Exception as e:
@@ -52,9 +63,11 @@ def recognize_chunk_with_retry(recognizer, audio, max_retries=3, delay=2.0):
 
 
 def recognize_speech_chunked(filename):
-    """Распознавание речи с разделением на части и обработкой таймаутов"""
     try:
-        audio_chunks = split_audio_segments(filename)
+        # Конвертируем видео/аудио в стандартный WAV перед нарезкой
+        wav_filename = convert_to_wav(filename)
+
+        audio_chunks = split_audio_segments(wav_filename)
 
         if len(audio_chunks) == 0:
             return "Не удалось обработать аудио (тишина или ошибка)"
@@ -70,7 +83,6 @@ def recognize_speech_chunked(filename):
                 with sr.AudioFile(chunk_buffer) as source:
                     audio = recognizer.record(source)
 
-                # Вызываем с автоматическими повторами при таймауте
                 text = recognize_chunk_with_retry(recognizer, audio, max_retries=3)
 
                 if text and text.strip():
@@ -80,17 +92,20 @@ def recognize_speech_chunked(filename):
                     print(f"  Часть {i}: пустой ответ")
 
             except sr.UnknownValueError:
-                print(f"  Часть {i}: не распознано")
+                print(f"  Часть {i}: не распознано (шум/тишина)")
             except sr.RequestError as e:
-                print(f"  Часть {i}: окончательная ошибка API после 3 попыток - {e}")
-                all_texts.append("[часть текста утеряна из-за таймаута]")
+                print(f"  Часть {i}: ошибка API - {e}")
+                all_texts.append("[часть текста пропущена]")
             except Exception as e:
                 print(f"  Часть {i}: ошибка - {str(e)[:50]}")
 
         full_text = " ".join(all_texts).strip()
 
+        # Удаляем временные файлы
         if os.path.exists(filename):
             os.remove(filename)
+        if os.path.exists(wav_filename) and wav_filename != filename:
+            os.remove(wav_filename)
 
         return full_text if full_text else "Не удалось распознать текст."
 
